@@ -1,0 +1,7 @@
+# Build artifacts
+/target
+Cargo.lock
+
+# Credentials: server hosts + tokens (never commit). Discovered at the
+# project root at runtime; ignored here in case a copy is placed alongside.
+.screeps.yaml
