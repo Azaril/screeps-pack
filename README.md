@@ -218,6 +218,15 @@ The pipeline is seven steps, each a library module; the CLI in `main.rs` is a th
 
 The design rationale — why `--target nodejs` over `--target web` plus a bundler, and the byte-for-byte parity evidence against the old `deploy.js` pipeline — is recorded in [PARITY.md](PARITY.md).
 
+## Troubleshooting
+
+| Symptom | Cause / fix |
+|---|---|
+| `deploy` finishes locally but the server rejects the code (or the module never starts) | The upload exceeded the **5 MiB** code-size limit. Like the classic `deploy.js`, `screeps-pack` warns loudly but uploads the map anyway, and the server rejects it server-side — so a "successful" local run can still fail. Check the size-used fraction `deploy` prints. Most often a `--debug` build of a large bot; rebuild without `--debug`, and make sure `wasm-opt` actually ran (see the next row). |
+| Hard error naming a `wasm-bindgen` version, refusing to patch the glue | The anchored glue patcher (`glue` step) only patches `wasm-bindgen` output shapes it has been verified against. Your `Cargo.lock` moved to a newer `wasm-bindgen` whose emitted glue drifted, so it stops rather than risk silent corruption. Pin `wasm-bindgen` back to a verified version in the lockfile, or extend the patcher (a small, test-covered change). |
+| Build succeeds but the wasm is larger/slower than expected; a `wasm-opt` warning in the log | `wasm-opt` couldn't be downloaded (blocked network or unsupported platform) and no `wasm-opt` was found on `PATH`, so optimization was skipped. The upload is still valid, just unoptimized. Put a `wasm-opt` on `PATH` or restore network access to the binaryen GitHub release. |
+| Error about a missing nightly toolchain before anything builds | Your configured build flags use `-Z build-std`, which requires **nightly** + the `rust-src` component. `screeps-pack` sanity-checks `cargo --version` up front. Pin nightly and add `rust-src` in a `rust-toolchain.toml` in your bot crate (see [Prerequisites](#prerequisites)). |
+
 ## Related crates
 
 - [screeps-rest-api](https://github.com/Azaril/screeps-rest-api) — the shared Screeps REST client (token and username/password auth, the `POST /api/user/code` upload shape) this crate depends on for upload.
