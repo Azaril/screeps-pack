@@ -201,10 +201,26 @@ async fn run_pipeline(options: &PackOptions, do_upload: bool) -> Result<PackOutc
     std::fs::write(dist_dir.join("main.js"), &loader_js)
         .with_context(|| format!("writing {}", dist_dir.join("main.js").display()))?;
 
-    // 7. module map (+ manifest), then upload
+    // 7. compress the wasm (raw DEFLATE + length header) so the `-g`
+    //    debug-symbol build fits under the 5 MiB code wall, then assemble
+    //    the module map (+ manifest) counting the COMPRESSED base64, and
+    //    upload.
     let wasm_bytes = std::fs::read(&bindgen_out.wasm_path)
         .with_context(|| format!("reading {}", bindgen_out.wasm_path.display()))?;
-    let map = upload::assemble(&project.module_name, &loader_js, &glue_js, &wasm_bytes);
+    let compressed_blob = glue::compress_wasm(&wasm_bytes)?;
+    tracing::info!(
+        "compressed wasm {:.2} MiB -> {:.2} MiB (raw deflate; base64 upload {:.2} MiB)",
+        wasm_bytes.len() as f64 / (1024.0 * 1024.0),
+        compressed_blob.len() as f64 / (1024.0 * 1024.0),
+        // base64 expands 4/3
+        (compressed_blob.len() as f64 * 4.0 / 3.0) / (1024.0 * 1024.0),
+    );
+    // Write the compressed blob into the dist tree (replaces the raw
+    // _bg.wasm that bindgen/wasm-opt left) so the dist artifacts match the
+    // uploaded module exactly.
+    std::fs::write(&bindgen_out.wasm_path, &compressed_blob)
+        .with_context(|| format!("writing compressed {}", bindgen_out.wasm_path.display()))?;
+    let map = upload::assemble(&project.module_name, &loader_js, &glue_js, &compressed_blob);
     upload::write_manifest(&dist_dir, &map)?;
 
     if map.used_mib > upload::CODE_SIZE_LIMIT_MIB {

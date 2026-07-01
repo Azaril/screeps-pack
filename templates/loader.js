@@ -3,13 +3,34 @@
 // port of the rustyscreeps starter's main.js (js_src/main.js): bucket-gated
 // boot, staged multi-tick wasm loading, the console.error shim, and the
 // wasm-bindgen#3130 running/halt() trap.
+//
+// COMPRESSION: the wasm bytes are uploaded raw-DEFLATE-compressed (with a
+// 4-byte little-endian original-length header prepended by screeps-pack) so
+// a `-g` (debug-symbol-retaining) build fits under the 5 MiB code-size wall.
+// The vendored pure-JS `screeps_pack_inflate` (tiny-inflate) is inlined
+// below and decompresses the blob before instantiation; both the compressed
+// blob and the inflated intermediate buffer are dropped after instantiation
+// so the heap never holds two copies of the wasm.
+__SCREEPS_PACK_INFLATE__
 
 // the patched wasm-bindgen glue module (uploaded alongside this loader)
 const bot = require("__SCREEPS_PACK_BOT_MODULE__");
-// the binary module holding the wasm bytes ({binary: <base64>} upload;
-// require() of it returns a Buffer of the decoded bytes)
+// the binary module holding the COMPRESSED wasm blob ({binary: <base64>}
+// upload; require() of it returns a Buffer of the decoded bytes)
 const WASM_MODULE_NAME = "__SCREEPS_PACK_WASM_MODULE__";
 const BUCKET_BOOT_THRESHOLD = __SCREEPS_PACK_BUCKET_THRESHOLD__;
+
+// Decompress the raw-DEFLATE blob (4-byte LE original-length header +
+// deflate stream) into a fresh Uint8Array of the exact original size.
+function screeps_pack_decompress(blob) {
+    // `blob` is a Buffer/Uint8Array of the require()'d binary module.
+    const src = blob instanceof Uint8Array ? blob : new Uint8Array(blob);
+    const origLen =
+        (src[0] | (src[1] << 8) | (src[2] << 16) | (src[3] << 24)) >>> 0;
+    const dest = new Uint8Array(origLen);
+    // subarray shares the backing buffer (no copy of the compressed bytes).
+    return screeps_pack_inflate(src.subarray(4), dest);
+}
 
 // This provides the function `console.error` that wasm_bindgen sometimes expects to exist,
 // especially with type checks in debug mode. An alternative is to have this be `function () {}`
@@ -74,7 +95,12 @@ function loaded_loop() {
 }
 
 // cache for each step of the wasm module's initialization
-let wasm_bytes, wasm_module, wasm_instance;
+//   compressed_blob : the require()'d {binary} module (raw-DEFLATE + header)
+//   wasm_bytes      : the inflated wasm (only alive briefly, between
+//                     decompress and compile — then dropped)
+//   wasm_module     : the compiled WebAssembly.Module (kept)
+//   wasm_instance   : the wired instance (kept)
+let compressed_blob, wasm_bytes, wasm_module, wasm_instance;
 
 module.exports.loop = function() {
     // need to freshly override the fake console object each tick
@@ -87,11 +113,20 @@ module.exports.loop = function() {
     }
 
     // run each step of the load process, saving each result so that this can happen over multiple ticks
-    if (!wasm_bytes) wasm_bytes = require(WASM_MODULE_NAME);
+    // 1) require the compressed blob (a Buffer of the base64-decoded upload)
+    if (!compressed_blob) compressed_blob = require(WASM_MODULE_NAME);
+    // 2) decompress it into the raw wasm bytes (trade a little CPU for the
+    //    code-size headroom that lets us keep -g debug symbols)
+    if (!wasm_bytes) wasm_bytes = screeps_pack_decompress(compressed_blob);
+    // 3) compile, then 4) instantiate + wire the wasm-bindgen glue
     if (!wasm_module) wasm_module = new WebAssembly.Module(wasm_bytes);
     if (!wasm_instance) wasm_instance = bot.__instantiate(wasm_module);
 
-    // remove the bytes from the heap and require cache, we don't need 'em anymore
+    // DEALLOC: the compiled module + linear memory now own everything the
+    // glue needs; drop BOTH the compressed blob and the inflated intermediate
+    // so the heap never keeps a second copy of the wasm (and evict the binary
+    // module from the require cache so it isn't retained there either).
+    compressed_blob = null;
     wasm_bytes = null;
     delete require.cache[WASM_MODULE_NAME];
 

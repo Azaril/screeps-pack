@@ -35,6 +35,9 @@
 //! evaluates.
 
 use anyhow::{bail, Result};
+use flate2::read::DeflateEncoder;
+use flate2::Compression;
+use std::io::Read;
 
 /// The vendored TextEncoder/TextDecoder polyfill
 /// (<https://github.com/anonyco/FastestSmallestTextEncoderDecoder>, CC0).
@@ -43,6 +46,29 @@ pub const TEXT_POLYFILL: &str = include_str!("../templates/text-encoder-decoder.
 /// The loader template (genericized js_src/main.js — bucket gate,
 /// staged init, console.error shim, wasm-bindgen#3130 halt trap).
 pub const LOADER_TEMPLATE: &str = include_str!("../templates/loader.js");
+
+/// The vendored pure-JS raw-DEFLATE decompressor (tiny-inflate, MIT/zlib —
+/// foliojs/tiny-inflate over Ibsen's tinf). Inlined into the loader so the
+/// isolate can decompress the wasm blob with no npm/module system. ~3 KiB.
+pub const INFLATE_TEMPLATE: &str = include_str!("../templates/tiny-inflate.js");
+
+/// Compress the wasm bytes for upload: a 4-byte little-endian
+/// original-length header followed by a RAW DEFLATE stream (no zlib/gzip
+/// header — matches the vendored tiny-inflate decompressor). Best
+/// compression: this runs once at build time; the CPU is free, the
+/// code-size headroom is what matters (a `-g` build's base64 drops from
+/// ~4.4 MiB to ~1.5 MiB, well under the 5 MiB wall). The loader reads the
+/// length header to size the decompression buffer exactly.
+pub fn compress_wasm(wasm: &[u8]) -> Result<Vec<u8>> {
+    let mut deflated = Vec::new();
+    DeflateEncoder::new(wasm, Compression::best())
+        .read_to_end(&mut deflated)
+        .map_err(|e| anyhow::anyhow!("deflating wasm: {e}"))?;
+    let mut blob = Vec::with_capacity(4 + deflated.len());
+    blob.extend_from_slice(&(wasm.len() as u32).to_le_bytes());
+    blob.extend_from_slice(&deflated);
+    Ok(blob)
+}
 
 /// Bindgen versions whose `--target nodejs` output the anchored patch
 /// is verified against. Other versions hard-error rather than risk
@@ -134,6 +160,7 @@ pub fn patch_bindgen_js(js: &str, module_name: &str, version: &str) -> Result<St
 /// Render the loader (`main`) module for a bot.
 pub fn render_loader(module_name: &str, bucket_boot_threshold: u32) -> Result<String> {
     let rendered = LOADER_TEMPLATE
+        .replace("__SCREEPS_PACK_INFLATE__", INFLATE_TEMPLATE)
         .replace("__SCREEPS_PACK_BOT_MODULE__", module_name)
         .replace("__SCREEPS_PACK_WASM_MODULE__", &format!("{module_name}_bg"))
         .replace(
@@ -249,20 +276,56 @@ mod tests {
         // The #3130 halt trap and its running flag.
         assert!(loader.contains("Game.cpu.halt();"));
         assert!(loader.contains("let running = false;"));
-        // Staged multi-tick init, exactly the main.js shape.
-        assert!(loader.contains("if (!wasm_bytes) wasm_bytes = require(WASM_MODULE_NAME);"));
+        // The vendored decompressor is inlined (its single global is
+        // attached) and the loader's decompress helper calls it.
+        assert!(loader.contains("global.screeps_pack_inflate = tinf_uncompress;"));
+        assert!(loader.contains("function screeps_pack_decompress(blob)"));
+        assert!(loader.contains("return screeps_pack_inflate(src.subarray(4), dest);"));
+        // Staged multi-tick init: require blob -> decompress -> compile ->
+        // instantiate.
+        assert!(loader.contains("if (!compressed_blob) compressed_blob = require(WASM_MODULE_NAME);"));
+        assert!(
+            loader.contains("if (!wasm_bytes) wasm_bytes = screeps_pack_decompress(compressed_blob);")
+        );
         assert!(
             loader.contains("if (!wasm_module) wasm_module = new WebAssembly.Module(wasm_bytes);")
         );
         assert!(
             loader.contains("if (!wasm_instance) wasm_instance = bot.__instantiate(wasm_module);")
         );
+        // DEALLOC: BOTH the compressed blob and the inflated intermediate are
+        // dropped (no 2x-wasm heap), and the binary module is evicted.
+        assert!(loader.contains("compressed_blob = null;"));
+        assert!(loader.contains("wasm_bytes = null;"));
+        assert!(loader.contains("delete require.cache[WASM_MODULE_NAME];"));
         // Bucket gate + the smoke-visible boot lines.
         assert!(loader.contains("Game.cpu.bucket < BUCKET_BOOT_THRESHOLD"));
         assert!(loader.contains("loading complete, CPU used"));
         // One-time setup then the per-tick loop swap.
         assert!(loader.contains("bot.setup();"));
         assert!(loader.contains("module.exports.loop = loaded_loop;"));
+    }
+
+    /// Compression: raw DEFLATE with a 4-byte LE original-length header,
+    /// round-trips byte-identical, and actually shrinks a compressible
+    /// payload.
+    #[test]
+    fn compress_wasm_headers_and_round_trips() {
+        use flate2::read::DeflateDecoder;
+        // A compressible payload (repetitive) so we can assert the win.
+        let original: Vec<u8> = (0..50_000u32).map(|i| (i % 7) as u8).collect();
+        let blob = compress_wasm(&original).unwrap();
+        // 4-byte LE header == original length.
+        let header = u32::from_le_bytes([blob[0], blob[1], blob[2], blob[3]]);
+        assert_eq!(header as usize, original.len());
+        // The deflate body decompresses byte-identical.
+        let mut back = Vec::new();
+        DeflateDecoder::new(&blob[4..])
+            .read_to_end(&mut back)
+            .unwrap();
+        assert_eq!(back, original);
+        // And it actually shrank.
+        assert!(blob.len() < original.len(), "compression must shrink");
     }
 
     #[test]

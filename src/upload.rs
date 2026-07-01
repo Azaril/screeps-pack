@@ -12,7 +12,12 @@
 //!
 //! Size accounting mirrors deploy.js:121-146 exactly: JS modules count
 //! their UTF-8 length, wasm modules their BASE64 length, against the
-//! 5 MiB code limit.
+//! 5 MiB code limit. The `_bg` module now carries the raw-DEFLATE
+//! COMPRESSED wasm blob (see `glue::compress_wasm`) rather than the raw
+//! wasm — so the base64 length counted here is the compressed size, which
+//! is the whole point: a `-g` (debug-symbol) build fits under the wall.
+//! `assemble` is format-agnostic (it base64s whatever `wasm_bytes` it is
+//! given); the pipeline passes the compressed blob.
 
 use anyhow::{Context, Result};
 use screeps_rest_api::{AuthMode, Client, CodeModule, CodeModules, DEFAULT_MIN_DELAY_MS};
